@@ -136,6 +136,7 @@ class Database:
 
 db = Database(DB_PATH)
 PENDING_JOBS = {}
+ACTIVE_JOBS = {}  # user_id -> {"status": "running"|"paused", "pause_event": asyncio.Event(), "cancelled": bool, "status_msg": Message}
 
 
 # ==========================================
@@ -330,7 +331,7 @@ class MediaPipeline:
 
 
 # ==========================================
-# Pyrogram MTProto Bot Client
+# Pyrogram MTProto Bot Client (High-Speed Turbo Engine)
 # ==========================================
 app = Client(
     "mtproto_course_bot",
@@ -338,25 +339,53 @@ app = Client(
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
     ipv6=False,
-    in_memory=True
+    in_memory=True,
+    max_concurrent_transmissions=8,
+    workers=16
 )
 
 
-def create_progress_callback(status_msg: Message, title: str, last_time: list):
+def get_control_keyboard(user_id: int, is_paused: bool = False) -> InlineKeyboardMarkup:
+    if is_paused:
+        buttons = [
+            [
+                InlineKeyboardButton("▶️ Resume", callback_data=f"ctl_resume_{user_id}"),
+                InlineKeyboardButton("⏹️ Stop Batch", callback_data=f"ctl_stop_{user_id}")
+            ]
+        ]
+    else:
+        buttons = [
+            [
+                InlineKeyboardButton("⏸️ Pause", callback_data=f"ctl_pause_{user_id}"),
+                InlineKeyboardButton("⏹️ Stop Batch", callback_data=f"ctl_stop_{user_id}")
+            ]
+        ]
+    return InlineKeyboardMarkup(buttons)
+
+
+def create_progress_callback(status_msg: Message, title: str, last_time: list, user_id: int):
     async def progress(current: int, total: int):
+        job = ACTIVE_JOBS.get(user_id)
+        if job and job.get("cancelled"):
+            raise asyncio.CancelledError("Upload cancelled by user.")
+
         now = time.time()
-        if now - last_time[0] > 4 or current == total:
+        if now - last_time[0] >= 5 or current == total:
             last_time[0] = now
-            pct = (current / total) * 100
+            pct = (current / total) * 100 if total > 0 else 0
             cur_mb = current / (1024 * 1024)
             tot_mb = total / (1024 * 1024)
-            try:
-                await status_msg.edit_text(
-                    f"📤 **Uploading to Telegram (MTProto 2GB):**\n`{title}`\n"
-                    f"📊 **Progress:** `{pct:.1f}%` ({cur_mb:.1f} MB / {tot_mb:.1f} MB)"
-                )
-            except Exception:
-                pass
+            async def _edit():
+                try:
+                    is_p = (job and job.get("status") == "paused")
+                    await status_msg.edit_text(
+                        f"📤 **Uploading to Telegram (MTProto Turbo):**\n`{title}`\n"
+                        f"📊 **Progress:** `{pct:.1f}%` ({cur_mb:.1f} MB / {tot_mb:.1f} MB)",
+                        reply_markup=get_control_keyboard(user_id, is_paused=is_p)
+                    )
+                except Exception:
+                    pass
+            asyncio.create_task(_edit())
     return progress
 
 
@@ -367,7 +396,43 @@ async def execute_batch_task(client: Client, user_id: int, source_chat_id: int, 
     uploaded_videos = 0
     uploaded_pdfs = 0
 
+    pause_event = asyncio.Event()
+    pause_event.set()
+
+    ACTIVE_JOBS[user_id] = {
+        "status": "running",
+        "pause_event": pause_event,
+        "cancelled": False,
+        "status_msg": status_msg
+    }
+
     for i, item in enumerate(entries, start=1):
+        job = ACTIVE_JOBS.get(user_id)
+        if not job or job.get("cancelled"):
+            try:
+                await status_msg.edit_text("⏹️ **Batch upload stopped by user.**")
+            except Exception:
+                pass
+            ACTIVE_JOBS.pop(user_id, None)
+            return
+
+        if job.get("status") == "paused":
+            try:
+                await status_msg.edit_text(
+                    f"⏸️ **Batch Paused at Item [{i}/{total}]:**\n`{item['title']}`\n\nClick Resume to continue.",
+                    reply_markup=get_control_keyboard(user_id, is_paused=True)
+                )
+            except Exception:
+                pass
+            await pause_event.wait()
+            if job.get("cancelled"):
+                try:
+                    await status_msg.edit_text("⏹️ **Batch upload stopped by user.**")
+                except Exception:
+                    pass
+                ACTIVE_JOBS.pop(user_id, None)
+                return
+
         title = MediaPipeline.sanitize(item["title"])
         url = item["url"]
         media_type = item["type"]
@@ -390,7 +455,8 @@ async def execute_batch_task(client: Client, user_id: int, source_chat_id: int, 
             try:
                 await status_msg.edit_text(
                     f"📄 **[{i}/{total}] Downloading PDF Notes:**\n`{title}`\n"
-                    f"🎯 **Target:** `{target_chat}`"
+                    f"🎯 **Target:** `{target_chat}`",
+                    reply_markup=get_control_keyboard(user_id, is_paused=False)
                 )
             except Exception:
                 pass
@@ -403,10 +469,14 @@ async def execute_batch_task(client: Client, user_id: int, source_chat_id: int, 
                         chat_id=target_chat,
                         document=str(out_path),
                         caption=f"📄 **{title}**\n📁 *Class Notes PDF*",
-                        progress=create_progress_callback(status_msg, f"{title}.pdf", last_time)
+                        progress=create_progress_callback(status_msg, f"{title}.pdf", last_time, user_id)
                     )
                     uploaded_pdfs += 1
                     db.record_upload(target_chat, title, url, "pdf")
+                except asyncio.CancelledError:
+                    out_path.unlink(missing_ok=True)
+                    ACTIVE_JOBS.pop(user_id, None)
+                    return
                 except Exception as e:
                     failed_count += 1
                     await client.send_message(
@@ -424,7 +494,8 @@ async def execute_batch_task(client: Client, user_id: int, source_chat_id: int, 
             try:
                 await status_msg.edit_text(
                     f"🎬 **[{i}/{total}] Downloading Full Video ({quality}):**\n`{title}`\n"
-                    f"🎯 **Target:** `{target_chat}`"
+                    f"🎯 **Target:** `{target_chat}`",
+                    reply_markup=get_control_keyboard(user_id, is_paused=False)
                 )
             except Exception:
                 pass
@@ -447,68 +518,74 @@ async def execute_batch_task(client: Client, user_id: int, source_chat_id: int, 
                         video=str(out_path),
                         caption=f"🎬 **{title}**\n⚡ *Full Video Lecture* ({file_size_mb:.1f} MB)",
                         supports_streaming=True,
-                        progress=create_progress_callback(status_msg, f"{title}.mp4", last_time)
+                        progress=create_progress_callback(status_msg, f"{title}.mp4", last_time, user_id)
                     )
                     uploaded_videos += 1
                     db.record_upload(target_chat, title, url, "video")
+                except asyncio.CancelledError:
+                    out_path.unlink(missing_ok=True)
+                    ACTIVE_JOBS.pop(user_id, None)
+                    return
                 except Exception as e:
                     failed_count += 1
                     await client.send_message(
                         chat_id=source_chat_id,
-                        text=f"❌ **Video Upload Error to {target_chat}:** `{e}`\n*(Ensure bot is Admin with Post permissions)*"
+                        text=f"❌ **Video Upload Error to {target_chat}:** `{e}`\n*(Ensure bot is Admin in target channel/group)*"
                     )
                 out_path.unlink(missing_ok=True)
             else:
                 failed_count += 1
-                await client.send_message(chat_id=source_chat_id, text=f"❌ **Video Failed:** `{title}`\nReason: `{msg_reason}`")
+                await client.send_message(chat_id=source_chat_id, text=f"❌ **Video Download Failed:** `{title}`\nReason: `{msg_reason}`")
 
+    ACTIVE_JOBS.pop(user_id, None)
+    summary_text = (
+        "🏁 **Batch Processing Completed!**\n\n"
+        f"🎯 **Target Destination:** `{target_chat}`\n"
+        f"📊 **Total Processed:** `{total}`\n"
+        f"🎬 **Videos Uploaded:** `{uploaded_videos}`\n"
+        f"📄 **PDF Notes Uploaded:** `{uploaded_pdfs}`\n"
+        f"⏭️ **Skipped (Duplicates):** `{skipped_duplicates}`\n"
+        f"❌ **Failed:** `{failed_count}`"
+    )
     try:
-        await status_msg.edit_text(
-            f"🏁 **Batch Task Completed!**\n\n"
-            f"📊 **Summary:**\n"
-            f"• Total Loaded: `{total}`\n"
-            f"• 🎬 Full Videos Sent: `{uploaded_videos}`\n"
-            f"• 📄 PDF Notes Sent: `{uploaded_pdfs}`\n"
-            f"• ⏭️ Skipped (Already Present): `{skipped_duplicates}`\n"
-            f"• ❌ Failed / 404: `{failed_count}`\n\n"
-            f"🎯 **Delivered Directly To:** `{target_chat}`"
-        )
+        await status_msg.edit_text(summary_text)
     except Exception:
-        pass
+        await client.send_message(chat_id=source_chat_id, text=summary_text)
 
 
-# ==========================
-# Interactive Wizard UI
-# ==========================
+# ==========================================
+# Wizard Steps & Prompts
+# ==========================================
 async def prompt_quality_step(message: Message, entries: list):
     user_id = message.from_user.id
-    video_count = sum(1 for e in entries if e["type"] == "video")
-    pdf_count = sum(1 for e in entries if e["type"] == "pdf")
-
     PENDING_JOBS[user_id] = {
         "entries": entries,
         "source_chat_id": message.chat.id,
         "step": "AWAITING_QUALITY"
     }
 
-    markup = InlineKeyboardMarkup([
+    vid_count = sum(1 for e in entries if e["type"] == "video")
+    pdf_count = sum(1 for e in entries if e["type"] == "pdf")
+
+    btns = [
         [
-            InlineKeyboardButton("1080p (Full HD)", callback_data="wiz_qual_1080p"),
-            InlineKeyboardButton("720p (HD)", callback_data="wiz_qual_720p")
+            InlineKeyboardButton("⚡ 480p (Standard Fast)", callback_data="wiz_qual_480p"),
+            InlineKeyboardButton("✨ 720p (HD Quality)", callback_data="wiz_qual_720p")
         ],
         [
-            InlineKeyboardButton("480p (Direct / Fast)", callback_data="wiz_qual_480p"),
-            InlineKeyboardButton("360p (Data Saver)", callback_data="wiz_qual_360p")
+            InlineKeyboardButton("🌟 1080p (Full HD)", callback_data="wiz_qual_1080p"),
+            InlineKeyboardButton("💾 360p (Low Data)", callback_data="wiz_qual_360p")
         ],
-        [InlineKeyboardButton("❌ Cancel Batch", callback_data="wiz_cancel")]
-    ])
+        [
+            InlineKeyboardButton("❌ Cancel", callback_data="wiz_cancel")
+        ]
+    ]
 
     await message.reply_text(
-        f"📁 **Found {len(entries)} items in manifest!**\n"
-        f"• 🎬 Video Lectures: `{video_count}`\n"
-        f"• 📄 PDF Notes Documents: `{pdf_count}`\n\n"
-        "🎬 **Step 1/2: Select Video Quality for video streams:**",
-        reply_markup=markup
+        f"📁 **Manifest Detected:**\n"
+        f"• Total Items: `{len(entries)}` (🎬 Videos: `{vid_count}` | 📄 PDFs: `{pdf_count}`)\n\n"
+        f"⚙️ **Step 1/2: Choose Video Download Quality:**",
+        reply_markup=InlineKeyboardMarkup(btns)
     )
 
 
@@ -535,7 +612,7 @@ async def prompt_destination_step(call: CallbackQuery, user_id: int):
 
 
 # ==========================
-# Handlers
+# Handlers & Interactive Controls
 # ==========================
 @app.on_message(filters.command(["start", "help"]))
 async def start_handler(_, message: Message):
@@ -544,7 +621,8 @@ async def start_handler(_, message: Message):
         "• ⚡ **No 50MB Bot Limit:** Full support up to **2,000 MB (2 GB)** files.\n"
         "• 📄 **PDFs** are delivered as authentic full PDF documents.\n"
         "• 🎬 **Videos** (.m3u8/.mp4) are captured with 100% duration & lossless audio.\n"
-        "• 🧠 **Memory Engine** automatically prevents re-uploading duplicate classes.\n\n"
+        "• 🧠 **Memory Engine** automatically prevents re-uploading duplicate classes.\n"
+        "• ⏸️ **Controls:** Pause, Resume, or Stop uploads anytime with buttons or `/pause`, `/resume`, `/stop`.\n\n"
         "📥 Upload your `.txt` file or paste course links to get started!"
     )
 
@@ -555,8 +633,96 @@ async def clear_history_handler(_, message: Message):
     await message.reply_text(f"🧹 Cleared **{cleared}** records from deduplication memory.")
 
 
+@app.on_message(filters.command(["pause"]))
+async def pause_command_handler(_, message: Message):
+    user_id = message.from_user.id
+    job = ACTIVE_JOBS.get(user_id)
+    if not job:
+        await message.reply_text("❌ No active batch upload to pause.")
+        return
+    job["status"] = "paused"
+    job["pause_event"].clear()
+    await message.reply_text(
+        "⏸️ **Batch upload paused.**\nSend `/resume` or use the button to continue.",
+        reply_markup=get_control_keyboard(user_id, is_paused=True)
+    )
+
+
+@app.on_message(filters.command(["resume"]))
+async def resume_command_handler(_, message: Message):
+    user_id = message.from_user.id
+    job = ACTIVE_JOBS.get(user_id)
+    if not job:
+        await message.reply_text("❌ No paused batch upload found.")
+        return
+    job["status"] = "running"
+    job["pause_event"].set()
+    await message.reply_text(
+        "▶️ **Batch upload resumed!**",
+        reply_markup=get_control_keyboard(user_id, is_paused=False)
+    )
+
+
+@app.on_message(filters.command(["stop", "cancel"]))
+async def stop_command_handler(_, message: Message):
+    user_id = message.from_user.id
+    job = ACTIVE_JOBS.get(user_id)
+    if not job:
+        await message.reply_text("❌ No active batch upload to stop.")
+        return
+    job["cancelled"] = True
+    job["pause_event"].set()
+    ACTIVE_JOBS.pop(user_id, None)
+    await message.reply_text("⏹️ **Batch upload stopped.**")
+
+
+@app.on_callback_query(filters.regex(r"^ctl_"))
+async def control_callback_handler(client: Client, call: CallbackQuery):
+    user_id = call.from_user.id
+    action = call.data.split("_")[1]
+    job = ACTIVE_JOBS.get(user_id)
+
+    if not job:
+        await call.answer("No active batch task running.", show_alert=True)
+        return
+
+    if action == "pause":
+        job["status"] = "paused"
+        job["pause_event"].clear()
+        await call.answer("⏸️ Batch Paused!")
+        try:
+            await call.message.edit_text(
+                "⏸️ **Batch Paused by User.**\n\nClick **Resume** to continue uploading.",
+                reply_markup=get_control_keyboard(user_id, is_paused=True)
+            )
+        except Exception:
+            pass
+
+    elif action == "resume":
+        job["status"] = "running"
+        job["pause_event"].set()
+        await call.answer("▶️ Batch Resumed!")
+        try:
+            await call.message.edit_text(
+                "▶️ **Resuming Batch Upload...**",
+                reply_markup=get_control_keyboard(user_id, is_paused=False)
+            )
+        except Exception:
+            pass
+
+    elif action == "stop":
+        job["cancelled"] = True
+        job["pause_event"].set()
+        ACTIVE_JOBS.pop(user_id, None)
+        await call.answer("⏹️ Batch Stopped!")
+        try:
+            await call.message.edit_text("⏹️ **Batch Upload Stopped by User.**")
+        except Exception:
+            pass
+
+
 @app.on_callback_query(filters.regex(r"^wiz_"))
-async def callback_handler(client: Client, call: CallbackQuery):
+async def wizard_callback_handler(client: Client, call: CallbackQuery):
     user_id = call.from_user.id
     job = PENDING_JOBS.get(user_id)
 
@@ -584,7 +750,8 @@ async def callback_handler(client: Client, call: CallbackQuery):
         status_msg = await call.message.edit_text(
             f"🚀 **Queue active:** {len(entries)} items\n"
             f"⚡ Quality: `{quality}` | 🎯 Destination: `Current Chat`\n"
-            "Starting MTProto direct stream worker..."
+            "Starting MTProto direct stream worker...",
+            reply_markup=get_control_keyboard(user_id, is_paused=False)
         )
         asyncio.create_task(execute_batch_task(client, user_id, source_chat, entries, quality, target, status_msg))
 
@@ -598,7 +765,8 @@ async def callback_handler(client: Client, call: CallbackQuery):
         status_msg = await call.message.edit_text(
             f"🚀 **Queue active:** {len(entries)} items\n"
             f"⚡ Quality: `{quality}` | 🎯 Destination: `{target}`\n"
-            "Starting MTProto direct stream worker..."
+            "Starting MTProto direct stream worker...",
+            reply_markup=get_control_keyboard(user_id, is_paused=False)
         )
         asyncio.create_task(execute_batch_task(client, user_id, source_chat, entries, quality, target, status_msg))
 
@@ -633,7 +801,7 @@ async def doc_handler(_, message: Message):
     await prompt_quality_step(message, entries)
 
 
-@app.on_message(filters.text & ~filters.command(["start", "help", "clear_history"]))
+@app.on_message(filters.text & ~filters.command(["start", "help", "clear_history", "pause", "resume", "stop", "cancel"]))
 async def text_handler(client: Client, message: Message):
     user_id = message.from_user.id
     job = PENDING_JOBS.get(user_id)
@@ -649,7 +817,8 @@ async def text_handler(client: Client, message: Message):
         status_msg = await message.reply_text(
             f"🚀 **Destination locked:** `{target}`\n"
             f"⚡ Quality: `{quality}` | Total: {len(entries)} items\n"
-            "Starting MTProto (2GB) background worker..."
+            "Starting MTProto (2GB) background worker...",
+            reply_markup=get_control_keyboard(user_id, is_paused=False)
         )
         asyncio.create_task(execute_batch_task(client, user_id, source_chat, entries, quality, target, status_msg))
         return
