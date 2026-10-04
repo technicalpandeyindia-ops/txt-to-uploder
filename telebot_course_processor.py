@@ -166,42 +166,32 @@ def run_health_server(port: int = 8080):
 # ==========================================
 def load_config():
     env_file = Path(".env")
-    token = ""
-    api_id = "6"
-    api_hash = "eb06d4abfb49dc3eeb1aeb98ae0f581e"
+    token = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN", "")
+    api_id = os.getenv("TELEGRAM_API_ID") or os.getenv("API_ID", "")
+    api_hash = os.getenv("TELEGRAM_API_HASH") or os.getenv("API_HASH", "")
 
     if env_file.exists():
-        with open(env_file, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith("TELEGRAM_BOT_TOKEN="):
-                    token = line.split("=", 1)[1].strip().strip('"').strip("'")
-                elif line.startswith("BOT_TOKEN="):
-                    token = line.split("=", 1)[1].strip().strip('"').strip("'")
-                elif line.startswith("TELEGRAM_API_ID=") or line.startswith("API_ID="):
-                    api_id = line.split("=", 1)[1].strip().strip('"').strip("'")
-                elif line.startswith("TELEGRAM_API_HASH=") or line.startswith("API_HASH="):
-                    api_hash = line.split("=", 1)[1].strip().strip('"').strip("'")
-    
-    token = token or os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN", "")
-    api_id = os.getenv("TELEGRAM_API_ID") or os.getenv("API_ID") or api_id
-    api_hash = os.getenv("TELEGRAM_API_HASH") or os.getenv("API_HASH") or api_hash
+        try:
+            with open(env_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not token and (line.startswith("TELEGRAM_BOT_TOKEN=") or line.startswith("BOT_TOKEN=")):
+                        token = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    elif not api_id and (line.startswith("TELEGRAM_API_ID=") or line.startswith("API_ID=")):
+                        api_id = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    elif not api_hash and (line.startswith("TELEGRAM_API_HASH=") or line.startswith("API_HASH=")):
+                        api_hash = line.split("=", 1)[1].strip().strip('"').strip("'")
+        except Exception:
+            pass
 
-    return token.strip(), int(api_id), api_hash.strip()
+    api_id_int = int(api_id) if str(api_id).isdigit() else 33466201
+    return token.strip(), api_id_int, api_hash.strip()
 
 
 BOT_TOKEN, API_ID, API_HASH = load_config()
 
 if not BOT_TOKEN:
-    print("=" * 60)
-    print("[!] TELEGRAM_BOT_TOKEN missing in .env")
-    print("=" * 60)
-    try:
-        BOT_TOKEN = input("Paste your Bot Token: ").strip()
-        with open(".env", "a", encoding="utf-8") as f:
-            f.write(f"\nTELEGRAM_BOT_TOKEN={BOT_TOKEN}\n")
-    except Exception:
-        sys.exit(1)
+    logger.error("FATAL: TELEGRAM_BOT_TOKEN is missing in environment variables and .env!")
 
 
 # ==========================================
@@ -346,7 +336,9 @@ app = Client(
     "mtproto_course_bot",
     api_id=API_ID,
     api_hash=API_HASH,
-    bot_token=BOT_TOKEN
+    bot_token=BOT_TOKEN,
+    ipv6=False,
+    in_memory=True
 )
 
 
