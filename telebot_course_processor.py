@@ -247,12 +247,27 @@ class MediaPipeline:
         return entries
 
     @staticmethod
+    def get_dynamic_headers(url: str) -> dict:
+        import urllib.parse
+        parsed = urllib.parse.urlparse(url)
+        origin = f"{parsed.scheme}://{parsed.netloc}" if parsed.netloc else "https://classx.co.in"
+        return {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+            "Accept": "*/*",
+            "Referer": f"{origin}/",
+            "Origin": origin
+        }
+
+    @staticmethod
     async def download_pdf(url: str, output_path: Path) -> tuple[bool, str]:
+        headers = MediaPipeline.get_dynamic_headers(url)
         try:
-            async with aiohttp.ClientSession(headers=HEADERS) as session:
+            async with aiohttp.ClientSession(headers=headers) as session:
                 async with session.get(url, timeout=180, ssl=False) as resp:
                     if resp.status == 404:
                         return False, "404 Not Found (Expired signature or missing on CDN)"
+                    if resp.status == 403:
+                        return False, "403 Forbidden (Token expired / unauthorized)"
                     if resp.status != 200:
                         return False, f"HTTP Error {resp.status}"
                     with open(output_path, "wb") as f:
@@ -269,11 +284,18 @@ class MediaPipeline:
 
     @staticmethod
     async def capture_full_video(url: str, output_path: Path, quality: str = "480p") -> tuple[bool, str]:
-        # Direct stream copy with TLS bypass (100% full duration, lossless audio)
+        headers = MediaPipeline.get_dynamic_headers(url)
+        headers_arg = f"User-Agent: {headers['User-Agent']}\r\nReferer: {headers['Referer']}\r\nOrigin: {headers['Origin']}\r\n"
+
+        # Stage 1: Direct stream copy with auto-reconnect
         cmd_copy = [
             FFMPEG_BIN, "-y",
             "-tls_verify", "0",
-            "-headers", f"User-Agent: {HEADERS['User-Agent']}\r\nReferer: {HEADERS['Referer']}\r\n",
+            "-reconnect", "1",
+            "-reconnect_at_eof", "1",
+            "-reconnect_streamed", "1",
+            "-reconnect_delay_max", "5",
+            "-headers", headers_arg,
             "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
             "-i", url,
             "-c", "copy",
@@ -281,17 +303,21 @@ class MediaPipeline:
             str(output_path)
         ]
         proc = await asyncio.create_subprocess_exec(*cmd_copy, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        await proc.communicate()
+        _, stderr = await proc.communicate()
 
         if proc.returncode == 0 and output_path.exists() and output_path.stat().st_size > 1024 * 100:
             return True, "OK (Full Stream Copy)"
 
-        # Transcode fallback
+        # Stage 2: Transcode fallback with scale filter
         preset = MediaPipeline.QUALITY_PRESETS.get(quality, MediaPipeline.QUALITY_PRESETS["480p"])
         cmd_transcode = [
             FFMPEG_BIN, "-y",
             "-tls_verify", "0",
-            "-headers", f"User-Agent: {HEADERS['User-Agent']}\r\nReferer: {HEADERS['Referer']}\r\n",
+            "-reconnect", "1",
+            "-reconnect_at_eof", "1",
+            "-reconnect_streamed", "1",
+            "-reconnect_delay_max", "5",
+            "-headers", headers_arg,
             "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
             "-i", url,
             "-c:v", "libx264",
@@ -303,20 +329,35 @@ class MediaPipeline:
             str(output_path)
         ]
         proc2 = await asyncio.create_subprocess_exec(*cmd_transcode, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        await proc2.communicate()
+        _, stderr2 = await proc2.communicate()
 
         if proc2.returncode == 0 and output_path.exists() and output_path.stat().st_size > 0:
             return True, "OK (Transcoded Video)"
 
-        return False, "Failed to capture HLS video stream"
+        # Stage 3: Extract diagnostic error from stderr
+        err_msg = ""
+        if stderr2:
+            err_text = stderr2.decode("utf-8", errors="ignore")
+            if "404 Not Found" in err_text or "Server returned 404" in err_text:
+                err_msg = "404 Not Found (Live stream playback window expired)"
+            elif "403 Forbidden" in err_text or "Server returned 403" in err_text:
+                err_msg = "403 Forbidden (Access token or stream token expired)"
+            elif "Failed to reload playlist" in err_text:
+                err_msg = "Stream ended or playlist unavailable"
+            else:
+                err_msg = err_text.strip().splitlines()[-1] if err_text.strip() else "Capture error"
+        return False, err_msg or "Failed to capture HLS video stream"
 
     @staticmethod
     async def fetch_mp4(url: str, output_path: Path) -> tuple[bool, str]:
+        headers = MediaPipeline.get_dynamic_headers(url)
         try:
-            async with aiohttp.ClientSession(headers=HEADERS) as session:
+            async with aiohttp.ClientSession(headers=headers) as session:
                 async with session.get(url, timeout=300, ssl=False) as resp:
                     if resp.status == 404:
                         return False, "404 Not Found"
+                    if resp.status == 403:
+                        return False, "403 Forbidden"
                     if resp.status != 200:
                         return False, f"HTTP Error {resp.status}"
                     with open(output_path, "wb") as f:
